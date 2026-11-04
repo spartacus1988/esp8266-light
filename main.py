@@ -57,6 +57,36 @@ def read_a0():
         return -1
 
 
+# --- автоуправление по A0 ------------------------------------
+# auto_mode = True  -> реле задаётся входом A0 (см. config.py)
+# auto_mode = False -> реле задаётся только кнопками на странице
+auto_mode = bool(config.AUTO_CONTROL)
+last_auto_ms = time.ticks_ms()
+
+
+def set_auto(enabled):
+    """Переключает авто-режим (без перезагрузки платы)."""
+    global auto_mode
+    auto_mode = bool(enabled)
+
+
+def poll_auto():
+    """Раз в AUTO_ADC_POLL_MS сверяет состояние реле с входом A0."""
+    global last_auto_ms
+    if not auto_mode:
+        return
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_auto_ms) < config.AUTO_ADC_POLL_MS:
+        return
+    last_auto_ms = now
+    value = read_a0()
+    if value < 0:  # АЦП не отвечает — не трогаем реле
+        return
+    want = value > config.AUTO_ADC_THRESHOLD
+    if want != light_on:
+        set_light(want)
+
+
 # ------------------------------------------------------- адрес платы
 def _ap_ip():
     try:
@@ -85,9 +115,12 @@ _PAGE = """<!DOCTYPE html>
 body{margin:0;padding:1.2em;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#12141a;color:#eaeef5;text-align:center}
 h1{font-size:1.35em;font-weight:600;margin:.5em 0 1.1em}
 .dot{width:120px;height:120px;border-radius:60px;margin:0 auto .7em;background:%s;box-shadow:0 0 50px %s}
-.state{font-size:1.5em;font-weight:700;letter-spacing:.08em;margin-bottom:1.3em;color:%s}
+.state{font-size:1.5em;font-weight:700;letter-spacing:.08em;margin-bottom:.5em;color:%s}
+.mode{font-size:.86em;color:#8b93a3;margin-bottom:1.2em;line-height:1.5}
+.mode b{color:#eaeef5}
 a.btn{display:block;padding:1.05em;margin:.55em auto;max-width:360px;border-radius:14px;text-decoration:none;font-size:1.05em;font-weight:700;color:#12141a;background:#ff5c5c}
 a.btn.go{background:#38d07a}
+a.btn.auto{background:#4aa3ff;color:#08111f}
 a.btn.warn{background:#3a3f4b;color:#eaeef5}
 .meta{margin-top:1.8em;font-size:.88em;color:#8b93a3;line-height:1.8}
 </style>
@@ -96,9 +129,12 @@ a.btn.warn{background:#3a3f4b;color:#eaeef5}
 <h1>%s</h1>
 <div class="dot"></div>
 <div class="state">%s</div>
+<div class="mode">%s</div>
 <a class="btn%s" href="%s">%s</a>
+%s
 <a class="btn warn" href="/?reset=1">ПЕРЕЗАГРУЗКА ПЛАТЫ</a>
 <div class="meta">
+Режим: <b>%s</b><br>
 Напряжение на A0: %d<br>
 Реле на GPIO%d &middot; WebREPL %s:%d
 </div>
@@ -113,13 +149,32 @@ def render():
     else:
         color, glow, state = "#2c313c", "rgba(255,255,255,.06)", "ВЫКЛЮЧЕН"
         extra, href, btn = "", "/?relay=on", "ВКЛЮЧИТЬ"
+
+    if auto_mode:
+        mode_name = "АВТО (по A0)"
+        mode_line = (
+            "реле управляется входом <b>A0</b>: больше %d &rarr; свет включён, "
+            "меньше или равно &rarr; выключен"
+            % config.AUTO_ADC_THRESHOLD
+        )
+        auto_btn = ""
+    else:
+        mode_name = "РУЧНОЙ"
+        mode_line = "автоуправление выключено &mdash; свет задаётся кнопками"
+        auto_btn = (
+            '<a class="btn auto" href="/?mode=auto">ВЕРНУТЬ АВТОУПРАВЛЕНИЕ ПО A0</a>'
+        )
+
     return _PAGE % (
         config.DEVICE_NAME,        # <title>
         color, glow,               # индикатор
         color,                     # цвет надписи состояния
         config.DEVICE_NAME,        # <h1>
         state,                     # ВКЛЮЧЁН / ВЫКЛЮЧЕН
+        mode_line,                 # строка режима
         extra, href, btn,          # кнопка
+        auto_btn,                  # кнопка «АВТО» (пусто в авто-режиме)
+        mode_name,                 # АВТО (по A0) / РУЧНОЙ
         read_a0(),                 # A0
         config.RELAY_PIN,          # GPIO реле
         IP,                        # IP
@@ -141,9 +196,16 @@ def send_page(conn):
 
 
 def send_json(conn):
-    body = ('{"relay":"%s","adc":%d,"ip":"%s"}' % ("on" if light_on else "off", read_a0(), IP)).encode(
-        "utf-8"
-    )
+    body = (
+        '{"relay":"%s","mode":"%s","adc":%d,"threshold":%d,"ip":"%s"}'
+        % (
+            "on" if light_on else "off",
+            "auto" if auto_mode else "manual",
+            read_a0(),
+            config.AUTO_ADC_THRESHOLD,
+            IP,
+        )
+    ).encode("utf-8")
     conn.sendall(_head(200, "OK", "application/json; charset=utf-8", len(body)).encode("utf-8") + body)
 
 
@@ -197,6 +259,16 @@ def is_on(value):
     return value.strip().lower() in ("1", "on", "true", "yes")
 
 
+def parse_mode(value):
+    """'auto'/'manual' (и синонимы) -> True/False; неизвестное значение -> None."""
+    v = (value or "").strip().lower()
+    if v in ("auto", "on", "1", "true", "yes"):
+        return True
+    if v in ("manual", "off", "0", "false", "no"):
+        return False
+    return None
+
+
 # ------------------------------------------------------- обработка запроса
 def handle(conn):
     conn.settimeout(3)
@@ -219,15 +291,29 @@ def handle(conn):
         send_empty(conn, 204, "No Content")
         return
 
+    # Кнопка ВКЛ/ВЫКЛ всегда означает «ручной режим»: авто-режим
+    # отключается только здесь, при простом просмотре страницы — нет.
     if path == "/api":
         if "relay" in params:
+            set_auto(False)
             set_light(is_on(params["relay"]))
+        elif "mode" in params:
+            mode = parse_mode(params["mode"])
+            if mode is not None:
+                set_auto(mode)
         send_json(conn)
         return
 
     if path in ("/", ""):
         if "relay" in params:
+            set_auto(False)
             set_light(is_on(params["relay"]))
+            send_redirect(conn, "/")
+            return
+        if "mode" in params:
+            mode = parse_mode(params["mode"])
+            if mode is not None:
+                set_auto(mode)
             send_redirect(conn, "/")
             return
         if "reset" in params:
