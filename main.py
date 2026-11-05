@@ -337,22 +337,34 @@ srv.listen(3)
 srv.settimeout(0.5)
 
 gc.collect()
-print("Управление светом: http://%s/" % IP)
 
-while True:
-    try:
-        conn, _addr = srv.accept()
-    except OSError:
-        # таймаут — просто ждём дальше (заодно WebREPL успевает работать)
-        continue
 
-    try:
-        handle(conn)
-    except Exception as err:
-        print("Ошибка запроса:", err)
-    finally:
+def serve():
+    """Главный цикл: обрабатывает запросы и опрашивает A0 (авто-режим)."""
+    print("Управление светом: http://%s/" % IP)
+    while True:
+        poll_auto()  # авто-режим: сверяем реле с A0 (раз в AUTO_ADC_POLL_MS)
+
         try:
-            conn.close()
+            conn, _addr = srv.accept()
         except OSError:
-            pass
-    gc.collect()
+            # таймаут — просто ждём дальше (заодно WebREPL успевает работать)
+            continue
+
+        try:
+            handle(conn)
+        except Exception as err:
+            print("Ошибка запроса:", err)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        gc.collect()
+
+
+# При обычном старте (boot.py -> main.py) цикл запускается сразу.
+# При импорте из тестов (import main) — нет, чтобы можно было
+# проверить обработку запросов без зависания.
+if __name__ == "__main__":
+    serve()

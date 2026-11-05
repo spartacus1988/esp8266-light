@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Прошивка MicroPython на Wemos D1 mini — ОДИН раз, по USB-кабелю.
 
@@ -65,20 +65,23 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ">>> Прошиваю MicroPython (write_flash) ..."
 # esptool v5 переименовал опцию --flash_size в --flash-size и НЕ принимает
-# форму "--flash_size=detect". Узнаём, какая версия стоит, по --help.
+# форму "--flash_size=detect". Размер флеша указываем ниже явно (4MB),
+# поэтому опцию детектирования не используем — только для информации.
 $help = ""
 try {
     $help = (& $python -m esptool write_flash --help 2>&1 | Out-String)
 } catch {
-    $help = ""   # не страшно — просто пропустим опцию размера флеша
+    $help = ""   # не страшно
 }
-$sizeOpt = $null
-if ($help -match '--flash-size') { $sizeOpt = "--flash-size=detect" }
-elseif ($help -match '--flash_size') { $sizeOpt = "--flash_size=detect" }
-if ($sizeOpt) { Write-Host ">>> Опция размера флеша: $sizeOpt" }
+if ($help -match '--flash-mode') {
+    Write-Host ">>> esptool поддерживает --flash-mode (установлен DIO + 4MB)"
+}
 
 $flashArgs = @("--baud", "460800", "write_flash")
-if ($sizeOpt) { $flashArgs += $sizeOpt }
+# Явно указываем режим и размер флеша: образ собран в QIO, а флеш-чипы
+# многих D1 mini его не поддерживают — плата зацикливает перезагрузку
+# (лог замирает на "rf_cal[0] !=0x05,is 0xFF"). DIO работает везде.
+$flashArgs += @("--flash-mode", "dio", "--flash-freq", "40m", "--flash-size", "4MB")
 $flashArgs += @("0", $bin)
 & $python -m esptool @common @flashArgs
 if ($LASTEXITCODE -ne 0) {
